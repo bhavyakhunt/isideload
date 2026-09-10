@@ -20,6 +20,8 @@ const URL_BAG: &str = "https://gsa.apple.com/grandslam/GsService2/lookup";
 
 pub struct GrandSlam {
     pub client: reqwest_middleware::ClientWithMiddleware,
+    /// Non-pooled client for the GsService2 login requests; see build_reqwest_client.
+    pub login_client: reqwest_middleware::ClientWithMiddleware,
     pub client_info: AnisetteClientInfo,
     url_bag: Dictionary,
 }
@@ -34,12 +36,19 @@ impl GrandSlam {
         debug: bool,
         proxy_url: Option<String>,
     ) -> Result<Self, Report> {
-        let client =
-            Self::build_reqwest_client(debug, proxy_url).context("Failed to build HTTP client")?;
+        let client = Self::build_reqwest_client(debug, proxy_url.clone(), false)
+            .context("Failed to build HTTP client")?;
+        // Login (GsService2 init/complete/apptokens) runs on a client that never
+        // reuses a pooled connection. The pooled `client` above serves the URL bag
+        // and the provisioning midStart/midFinish pair, which needs connection
+        // affinity. See build_reqwest_client.
+        let login_client = Self::build_reqwest_client(debug, proxy_url, true)
+            .context("Failed to build login HTTP client")?;
         let base_headers = Self::base_headers(&client_info, false)?;
         let url_bag = Self::fetch_url_bag(&client, base_headers).await?;
         Ok(Self {
             client,
+            login_client,
             client_info,
             url_bag,
         })
@@ -169,6 +178,54 @@ impl GrandSlam {
         Ok(response_plist)
     }
 
+    /// Like `post`, but on the non-pooled `login_client` so the request dials a
+    /// fresh connection — for the GsService2 login requests Apple's edge 429/503s
+    /// when they share a connection.
+    pub fn post_login(&self, url: &str) -> Result<reqwest_middleware::RequestBuilder, Report> {
+        let builder = self
+            .login_client
+            .post(url)
+            .headers(Self::base_headers(&self.client_info, false)?);
+
+        Ok(builder)
+    }
+
+    /// Same as `plist_request` but on a fresh connection (see `post_login`).
+    pub async fn plist_request_fresh(
+        &self,
+        url: &str,
+        body: &Dictionary,
+        additional_headers: Option<HeaderMap>,
+    ) -> Result<Dictionary, Report> {
+        let resp = self
+            .post_login(url)?
+            .headers(additional_headers.unwrap_or_else(reqwest::header::HeaderMap::new))
+            .body(plist_to_xml_string(body))
+            .send()
+            .await
+            .context("Failed to send grandslam request")?
+            .error_for_status()
+            .context("Received error response from grandslam")?
+            .text()
+            .await
+            .context("Failed to read grandslam response as text")?;
+
+        let dict: Dictionary = plist::from_bytes(resp.as_bytes())
+            .context("Failed to parse grandslam response plist")
+            .attach_with(|| resp.clone())?;
+
+        let response_plist = dict
+            .get("Response")
+            .and_then(|v| v.as_dictionary())
+            .cloned()
+            .ok_or_else(|| {
+                report!("grandslam response missing 'Response'")
+                    .attach(pretty_print_dictionary(&dict))
+            })?;
+
+        Ok(response_plist)
+    }
+
     fn base_headers(
         client_info: &AnisetteClientInfo,
         sms: bool,
@@ -207,28 +264,35 @@ impl GrandSlam {
     /// - `debug`: DANGER, If true, accept invalid certificates and enable verbose connection logging
     /// # Errors
     /// Returns an error if the reqwest client cannot be built
+    #[cfg_attr(feature = "wasm", allow(unused_variables))]
     pub fn build_reqwest_client(
         debug: bool,
         proxy_url: Option<String>,
+        no_pool: bool,
     ) -> Result<reqwest_middleware::ClientWithMiddleware, Report> {
         #[cfg(not(feature = "wasm"))]
         let cert = Certificate::from_der(APPLE_ROOT)?;
         #[cfg(not(feature = "wasm"))]
-        let client = ClientBuilder::new()
-            .add_root_certificate(cert)
-            .http1_title_case_headers()
+        let client = {
+            let mut builder = ClientBuilder::new()
+                .add_root_certificate(cert)
+                .http1_title_case_headers()
+                .danger_accept_invalid_certs(debug)
+                .connection_verbose(debug);
             // Apple's GSA edge (since ~2026-08-31) caps requests per TCP
             // connection: the first request on a connection is answered, later
-            // ones get 503/429. A sign-in makes several requests (provision,
-            // init, complete, apptokens) and reqwest keep-alive would send them
-            // down one pooled connection, so everything after the first failed.
-            // Keeping zero idle connections forces a fresh connection per
-            // request. Equivalent to AltSign's fresh-session-per-request fix
+            // ones get 429/503. The GsService2 login requests
+            // (init/complete/apptokens) run on a `no_pool` client so each dials a
+            // fresh connection. The provisioning midStart/midFinish pair MUST
+            // stay pooled — it is a stateful session that returns -45025
+            // "unknown session" if start and end reach different backends.
+            // Same remedy as AltSign's fresh-session-per-request fix
             // (rileytestut/AltSign#52).
-            .pool_max_idle_per_host(0)
-            .danger_accept_invalid_certs(debug)
-            .connection_verbose(debug)
-            .build()?;
+            if no_pool {
+                builder = builder.pool_max_idle_per_host(0);
+            }
+            builder.build()?
+        };
         #[cfg(feature = "wasm")]
         let client = ClientBuilder::new().build()?;
 
