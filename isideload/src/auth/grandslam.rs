@@ -217,6 +217,15 @@ impl GrandSlam {
         let client = ClientBuilder::new()
             .add_root_certificate(cert)
             .http1_title_case_headers()
+            // Apple's GSA edge (since ~2026-08-31) caps requests per TCP
+            // connection: the first request on a connection is answered, later
+            // ones get 503/429. A sign-in makes several requests (provision,
+            // init, complete, apptokens) and reqwest keep-alive would send them
+            // down one pooled connection, so everything after the first failed.
+            // Keeping zero idle connections forces a fresh connection per
+            // request. Equivalent to AltSign's fresh-session-per-request fix
+            // (rileytestut/AltSign#52).
+            .pool_max_idle_per_host(0)
             .danger_accept_invalid_certs(debug)
             .connection_verbose(debug)
             .build()?;
